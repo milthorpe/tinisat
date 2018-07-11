@@ -32,8 +32,8 @@ Fifth Floor, Boston, MA  02110-1301  USA
 #define _DT 32		// RSAT phase selection threshold 
 
 struct compScores: public binary_function<unsigned, unsigned, bool>{
-	Variable *vars;
-	compScores(Variable *myVars) : vars(myVars) {}
+	unsigned *activity;
+	compScores(unsigned *myActivity) : activity(myActivity) {}
 	bool operator()(unsigned a, unsigned b) const{ 
 		return SCORE(a) > SCORE(b); 
 	}
@@ -45,24 +45,24 @@ SatSolver::SatSolver(Cnf &cnf): CnfManager(cnf){
 	nextDecay = HALFLIFE;
 
 	// assertUnitClauses has failed
-	if(dLevel == 0) return; 
+	if(currentDLevel == 0) return;
 
 	// assert pure literals
-	for(int i = 1; i <= (int) vc; i++) if(vars[i].value == _FREE){
-		if(vars[i].activity[_POSI] == 0 && vars[i].activity[_NEGA] > 0)
+	for(int i = 1; i <= (int) vc; i++) if(!assigned[i]){
+		if(ACTIVITY(i, _POSI) == 0 && ACTIVITY(i, _NEGA) > 0)
 			// ante is NULL, as opposed to empty clause for implied literals
 			assertLiteral(-i, NULL);	
-		else if(vars[i].activity[_NEGA] == 0 && vars[i].activity[_POSI] > 0)
+		else if(ACTIVITY(i, _NEGA) == 0 && ACTIVITY(i, _POSI) > 0)
 			assertLiteral(i, NULL);
 	}
 
 	// initialize varOrder
 	nVars = 0; for(unsigned i = 1; i <= vc; i++) 
-		if(vars[i].value == _FREE && SCORE(i) > 0){
+		if(!assigned[i] && SCORE(i) > 0){
 			varOrder[nVars++] = i;
-			vars[i].phase = (vars[i].activity[_POSI] > vars[i].activity[_NEGA])?_POSI:_NEGA;
+			phase[i] = (ACTIVITY(i, _POSI) > ACTIVITY(i, _NEGA))?_POSI:_NEGA;
 		}
-	sort(varOrder, varOrder + nVars, compScores(vars));
+	sort(varOrder, varOrder + nVars, compScores(activity));
 	for(unsigned i = 0; i < nVars; i++) varPosition[varOrder[i]] = i; 
 	nextVar = 0; 
 	nextClause = clauses.size() - 1; 
@@ -89,28 +89,28 @@ int SatSolver::selectLiteral(){
 		}
 
 		// RSAT phase selection
-		int d = vars[x].activity[_POSI] - vars[x].activity[_NEGA];
+		int d = ACTIVITY(x, _POSI) - ACTIVITY(x, _NEGA);
 		if(d > _DT) return x; else if(-d > _DT) return -x;
-		else return (vars[x].phase == _POSI)?(x):-(int)(x);
+		else return (phase[x] == _POSI)?(x):-(int)(x);
 	}
 
 	// fall back to VSIDS 
 	for(unsigned i = nextVar; i < nVars; i++){
-		if(vars[varOrder[i]].value == _FREE){
+		if(!assigned[varOrder[i]]){
 			x = varOrder[i];
 			nextVar = i + 1;
 
 			// RSAT phase selection
-			int d = vars[x].activity[_POSI] - vars[x].activity[_NEGA];
+			int d = ACTIVITY(x, _POSI) - ACTIVITY(x, _NEGA);
 			if(d > _DT) return x; else if(-d > _DT) return -x;
-			else return (vars[x].phase == _POSI)?(x):-(int)(x);
+			else return (phase[x] == _POSI)?(x):-(int)(x);
 		}
 	}
 	return 0;
 }
 
 bool SatSolver::run(){
-	if(dLevel == 0) return false; 		// assertUnitClauses has failed
+	if(currentDLevel == 0) return false; 		// assertUnitClauses has failed
 	for(int lit; (lit = selectLiteral());){ // pick decision literal
 		if(!decide(lit)) do{ 		// decision/conflict
 			// conflict has occurred in dLevel 1, unsat 
@@ -130,7 +130,7 @@ bool SatSolver::run(){
 				nRestarts++;
 				nextRestart += luby.next() * lubyUnit;
 				backtrack(1);
-				if(dLevel != aLevel) break;
+				if(currentDLevel != aLevel) break;
 
 			// partial restart at aLevel 
 			}else backtrack(aLevel);
@@ -156,8 +156,8 @@ bool SatSolver::verifySolution(){
 
 void SatSolver::printSolution(FILE *ofp){
 	for(unsigned i = 1; i <= vc; i++)
-		if(vars[i].value == _POSI) fprintf(ofp, "%d ", i);
-		else if(vars[i].value == _NEGA) fprintf(ofp, "-%d ", i);
+		if(assigned[i] && truthVal[i]) fprintf(ofp, "%d ", i);
+		else if(assigned[i] && !truthVal[i]) fprintf(ofp, "-%d ", i);
 	fprintf(ofp, "0\n");
 }
 

@@ -34,8 +34,23 @@ Fifth Floor, Boston, MA  02110-1301  USA
 #endif
 
 CnfManager::CnfManager(Cnf &cnf){
-	vars = new Variable[(vc = cnf.vc) + 1];
-	dLevel = 1;
+	vc = cnf.vc;
+	vars = new Variable[vc + 1];
+
+	mark = new bool[vc + 1];
+	phase = new bool[vc + 1];
+	assigned = new bool[vc + 1];
+	std::fill(assigned, assigned + vc + 1, false);
+	truthVal = new bool[vc + 1];
+	dLevel = new unsigned[vc + 1];
+	antecedent = new int*[vc + 1];
+	activity = new unsigned[(vc + 1) * 2];
+	watched = new vector<int*>[(vc + 1) * 2];
+	for (unsigned i = 0; i < (vc+1)*2; i++) {
+		watched[i].clear();
+	}
+
+	currentDLevel = 1;
 	nDecisions = nConflicts = nRestarts = 0; 
 	varOrder = (unsigned *) calloc(vc + 1, sizeof(unsigned));
 	varPosition = (unsigned *) calloc(vc + 1, sizeof(unsigned));
@@ -48,8 +63,8 @@ CnfManager::CnfManager(Cnf &cnf){
 	imp[1].resize(vc + 1);
 
 	// mark bottom of stack with variable 0
-	vars[*(stackTop++) = 0].dLevel = 0;
-	vars[0].value = _FREE;
+	dLevel[*(stackTop++) = 0] = 0;
+	assigned[0] = false;
 
 	// create litPool
 	int *p = litPool = (int *) calloc(litPoolCapacity = (cnf.lc + cnf.cc) * 2, sizeof(int));
@@ -76,16 +91,16 @@ CnfManager::CnfManager(Cnf &cnf){
 			int lit1 = cnf.clauses[i][1];
 			imp[SIGN(lit0)][VAR(lit0)].push_back(lit1);
 			imp[SIGN(lit1)][VAR(lit1)].push_back(lit0);
-			vars[VAR(lit0)].activity[SIGN(lit0)]++;
-			vars[VAR(lit1)].activity[SIGN(lit1)]++;
+			ACTIVITY(VAR(lit0), SIGN(lit0))++;
+			ACTIVITY(VAR(lit1), SIGN(lit1))++;
 		}else{
 			// set up watches
-			WATCHLIST(cnf.clauses[i][0]).push_back(p);
-			WATCHLIST(cnf.clauses[i][1]).push_back(p);
+			ADD_TO_WATCHLIST(cnf.clauses[i][0], p);
+			ADD_TO_WATCHLIST(cnf.clauses[i][1], p);
 
 			// copy literals to litPool
 			for(j = 0; (*(p++) = cnf.clauses[i][j]); j++){
-				vars[VAR(*(p-1))].activity[SIGN(*(p-1))]++;
+				ACTIVITY(VAR(*(p-1)), SIGN(*(p-1)))++;
 			}
 		}
 	}
@@ -112,7 +127,7 @@ CnfManager::~CnfManager(){
 	for(vector<int *>::iterator it = litPools.begin(); it != litPools.end(); free(*(it++)));
 	while(*(--stackTop)); free(stackTop);
 	for(unsigned i = 1; i <= vc; i++) for(unsigned j = 0; j <= 1; j++) free(vars[i].imp[j]);
-	free(varOrder); free(varPosition); delete [] vars;
+	free(varOrder); free(varPosition); delete[] vars; delete[] mark; delete[] phase; delete[] assigned; delete[] truthVal; delete[] dLevel;
 }
 
 bool CnfManager::assertUnitClauses(){
@@ -120,7 +135,7 @@ bool CnfManager::assertUnitClauses(){
 		int lit = *p;
 		*p = *(--stackTop);
 		if(!assertLiteral(lit, litPool + litPoolSize - 1)){
-		       backtrack(dLevel - 1);
+		       backtrack(currentDLevel - 1);
 	       	       return false;
 		}
 	}
@@ -128,15 +143,16 @@ bool CnfManager::assertUnitClauses(){
 }
 
 inline void CnfManager::setLiteral(int lit, int *ante){
-	vars[VAR(lit)].value = SIGN(lit);
-	vars[VAR(lit)].ante = ante;
-	vars[VAR(lit)].dLevel = dLevel;
+	assigned[VAR(lit)] = true;
+	truthVal[VAR(lit)] = SIGN(lit);
+	antecedent[VAR(lit)] = ante;
+	dLevel[VAR(lit)] = currentDLevel;
 }
 
 bool CnfManager::assertLiteral(int lit, int *ante){
 	int *newStackTop = stackTop;
 	setLiteral(*(newStackTop++) = lit, ante);
-	DB(printf("%d: %d =>", dLevel, lit);)
+	DB(printf("%d: %d =>", currentDLevel, lit);)
 
 	while(stackTop < newStackTop){
 		// the literal resolved (as opposed to set)
@@ -144,10 +160,9 @@ bool CnfManager::assertLiteral(int lit, int *ante){
 
 		// implications via binary clauses
 		int *impList = IMPLIST(lit);
-		for(int *imp = impList + 3; true; imp++){
+		for(int *imp = impList + 3; *imp != 0; imp++){
 			// implication
 			if(FREE(*imp)){
-				if(*imp == 0) break; 	// end of list
 				DB(printf(" %d", *imp);)
 				setLiteral(*(newStackTop++) = *imp, impList + 1); 
 			// contradiction
@@ -181,7 +196,7 @@ bool CnfManager::assertLiteral(int lit, int *ante){
 			// free/true literal found, swap
 			if(found){
 				// watch p
-				WATCHLIST(*p).push_back(first);
+				ADD_TO_WATCHLIST(*p, first);
 
 				// unwatch watch
 				*(it--) = watchList.back();
@@ -218,7 +233,7 @@ bool CnfManager::assertLiteral(int lit, int *ante){
 
 void CnfManager::learnClause(int *first){
 	// contradiction in level 1, instance unsat
-	if(dLevel == 1){ aLevel = 0; return; }
+	if(currentDLevel == 1){ aLevel = 0; return; }
 
 	// update var scores and positions
 	updateScores(first);
@@ -231,11 +246,11 @@ void CnfManager::learnClause(int *first){
 	// push to tmpConflictLits those set prior to current dLevel
 	for(tmpConflictLits.clear(); *first; first++){
 		// drop known backbone literals
-		if(vars[VAR(*first)].dLevel == 1) continue;
+		if(dLevel[VAR(*first)] == 1) continue;
 
-		if(vars[VAR(*first)].dLevel < dLevel) tmpConflictLits.push_back(*first);
+		if(dLevel[VAR(*first)] < currentDLevel) tmpConflictLits.push_back(*first);
 		else curLevelLits++;
-		vars[VAR(*first)].mark = true;
+		mark[VAR(*first)] = true;
 	}
 
 	// generate 1-UIP conflict clause
@@ -243,17 +258,17 @@ void CnfManager::learnClause(int *first){
 		// pop literal from stack as in backtrack
 		lit = *(--stackTop); 
 		unsigned var = VAR(lit);
-		vars[var].value = _FREE;
-		if(!vars[var].mark){
+		assigned[var] = false;
+		if(!mark[var]){
 			if(varPosition[var] < nextVar) nextVar = varPosition[var];
 			continue;
 		}
 
 		// unmark
-		vars[var].mark = false;
+		mark[var] = false;
 		
 		// if not decision, update scores for the whole ante clause
-		if(vars[var].ante) updateScores(vars[var].ante - 1);
+		if(antecedent[var]) updateScores(antecedent[var] - 1);
 
 		// update nextVar
 		if(varPosition[var] < nextVar) nextVar = varPosition[var];
@@ -262,11 +277,11 @@ void CnfManager::learnClause(int *first){
 		if(curLevelLits-- == 1) break;
 
 		// else, replace with antecedent (resolution)
-		for(int *ante = vars[var].ante; *ante; ante++){
-			if(vars[VAR(*ante)].mark || vars[VAR(*ante)].dLevel == 1) continue;
-			if(vars[VAR(*ante)].dLevel < dLevel) tmpConflictLits.push_back(*ante);
+		for(int *ante = antecedent[var]; *ante; ante++){
+			if(mark[VAR(*ante)] || dLevel[VAR(*ante)] == 1) continue;
+			if(dLevel[VAR(*ante)] < currentDLevel) tmpConflictLits.push_back(*ante);
 			else curLevelLits++;
-			vars[VAR(*ante)].mark = true;
+			mark[VAR(*ante)] = true;
 		}
 	}
 
@@ -277,12 +292,12 @@ void CnfManager::learnClause(int *first){
 	deque<int>::iterator it;
 	for(it = tmpConflictLits.begin(); it != tmpConflictLits.end(); it++){
 		bool redundant = true;
-		int *ante = vars[VAR(*it)].ante;
+		int *ante = antecedent[VAR(*it)];
 		if(ante == NULL) redundant = false;
-		else for(; *ante; ante++) if(!vars[VAR(*ante)].mark){ redundant = false; break; }
+		else for(; *ante; ante++) if(!mark[VAR(*ante)]){ redundant = false; break; }
 		if(!redundant){
-			if(vars[VAR(*it)].dLevel > aLevel){
-			       	aLevel = vars[VAR(*it)].dLevel;	
+			if(dLevel[VAR(*it)] > aLevel){
+			       	aLevel = dLevel[VAR(*it)];
 		       		conflictLits.push_front(*it);
 			}else conflictLits.push_back(*it);
 		}
@@ -290,7 +305,7 @@ void CnfManager::learnClause(int *first){
 
 	// clear variable marks
 	for(it = tmpConflictLits.begin(); it != tmpConflictLits.end(); it++)
-		vars[VAR(*it)].mark = false;
+		mark[VAR(*it)] = false;
 
 	// unique lit from current dLevel pushed last
 	conflictLits.push_back(-lit);
@@ -353,7 +368,7 @@ inline void CnfManager::addClause(){
 void CnfManager::updateScores(int *p){
 	for(; *p; p++){
 		unsigned v = VAR(*p);
-		vars[v].activity[SIGN(*p)]++;
+		ACTIVITY(v, SIGN(*p))++;
 		unsigned it = varPosition[v];
 		
 		// variable already at beginning
